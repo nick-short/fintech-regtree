@@ -1,0 +1,273 @@
+---
+title: "Fintech Patents Text Analytics"
+author: "Nick Short"
+date: "10/19/2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(ggplot2)
+library(e1071)
+library(caret)
+library(quanteda)
+library(irlba)
+library(rpart)
+library(rpart.plot)
+library(randomForest)
+library(dplyr)
+```
+
+# Introduction
+
+In this document, I explain the basic workflow and output in the text analytics code for the fintech patents project.  I describe the code used to implement a basic classification tree model on patent titles to determine whether or not the patent is a fintech patent, using 10-fold cross-validation.  I display small snippets of data along the way to monitor and explain the implementation.  I also display some preliminary results from running the model on a set of test data.
+
+Please note that this is not a writeup of results; it is a demonstration of a proof of concept for discussion purposes.  Below, I use very simple baseline data (based only on CPC codes and not other factors, like standardized assignees) and I take a small random sample of that data so that I can execute the model on a personal computer.  My primary purpose is to document how the code will actually run and what the model output will look like.
+
+# Acquire and Format Data 
+
+We first obtained data for textual analysis by performing Standard SQL searches within the IFI Claims patent data made available through Google Biq Query (see <https://bigquery.cloud.google.com/table/patents-public-data:patents.publications?pli=1>).  The SQL code is documented in the shared fintech patent project document.  In the code I ran to illustrate workflow below, I ran two searches within the set of all granted U.S. patents published after January 1, 1970 in the English language: (1) a search producing the title and patent number of all patents that have a CPC classification code beginning in G06Q40/, which generally represents financial software patents, and (2) a searching producing the title and patent number of all patents that have a CPC classification code beginning with G06Q, which represents the broader category of data systems and methods, but which do not contain a CPC code beginning with G06Q40/.  For more information on these CPC codes, see <https://www.uspto.gov/web/patents/classification/cpc/html/cpc-G06Q.html>.
+
+After loading the two .csv files which contain the results of these searches, I append to each data frame a 'label' variable that equals 1 for financial patents (21,976 observations) and 0 for data systems patents that are not financial patents (100,389 observations), and then merge the two data sets.  
+
+```{r stitch}
+
+          ## Stitch together data
+
+financial_patents <- read.csv('ml_cpc_to_titles.csv', stringsAsFactors = FALSE)
+financial_patents$label <- 1
+
+nonfinancial_patents <- read.csv('ml_baseline_cpc_to_titles.csv', stringsAsFactors = FALSE)
+nonfinancial_patents$label <- 0
+
+patents <- data.frame(rbind(financial_patents,nonfinancial_patents))
+```
+
+Because the combined data set with more than 120,000 observations is too large to handle on a standard personal computer, I take a random sample of 5k observations within the patents data frame.  Two observations (entries 3 and 4) from this random sample are printed below as examples.
+
+```{r sample}
+
+          ## Take a random sample of only 5k observations for initial testing
+
+
+set.seed(02135)
+index <- sample(1:nrow(patents), 5000, replace = F)
+sample <- patents[index,]
+print(sample[3:4,], row.names = FALSE)
+```
+
+I then partitioned the data to create a 70/30 split into training and test sets of 3,500 and 1,500 observations respectively.  Because I have not pulled data on the publication date from Google Big Query, I am not stratifying on a variable like publication year, which might be helpful if we think that language used to describe financial patents changes over time.  This is something to consider for future work.
+
+```{r partition}
+
+          ## Partition data 
+
+set.seed(02135)
+indexes <- createDataPartition(sample$label, times = 1, p = 0.7, list = FALSE) 
+train <- sample[indexes,]
+test <- sample[-indexes,]
+```
+
+We can see that the output of the partition is a training data set and a test data set based on the sample that have comparable percentages of financial patents compared to each other and to the combined data set with over 120k obervations.
+
+```{r, echo=FALSE}
+paste("Test Set:", as.character(round(100*mean(test$label), digits = 2)), "%", sep = " ")
+paste("Training Set:", as.character(round(100*mean(train$label), digits = 2)), "%", sep = " ")
+paste("All Data:", as.character(round(100*mean(patents$label), digits = 2)), "%", sep = " ")
+```
+
+# Pre Process Training Data
+
+The title variable in both the training and the test set need pre-processing before we can perform TF-IDF (text frequency - inverse document frequency) analysis.  I implement this with a function, 'pre_process', that calls on common text cleaning functions in the quanteda library to remove numbers, punctuation, symbols, and hyphens from all words, to convert all letters to lower case, to remove common English stop words (like "of", "as", and "by"), and to execute word stemming (which reduces "financial" and "financing" to "financ", for example).
+```{r train_preprocess, warning = FALSE}
+
+          ## Pre-process the training set
+
+pre_process <- function(data){
+  # Tokenize; this will produce a dfmSparse object that is indexed like a list
+  data_tokens <- tokens(data$title, what = "word", remove_numbers = TRUE, 
+                         remove_punct = TRUE, remove_symobls = TRUE, 
+                         remove_hyphens = TRUE) 
+  data_tokens <- tokens_tolower(data_tokens)
+  data_tokens <- tokens_select(data_tokens, stopwords(), selection = "remove")
+  data_tokens <- tokens_wordstem(data_tokens, language = "english")
+}
+
+train_tokens <- pre_process(train)
+```
+
+The pre-processed data, train_tokens, must then be converted into certain data types (a document frequency matrix, a standard matrix, a standard data frame) for further analysis and visualization, and the label indicator variable (indicating whether a patent is financial or not) must be added back into the data frame.  I also capitalzie the names of the variables 'Document' and 'Label' so that they will not be confused with the same words that are present in the patent titles.
+
+```{r train_convert}
+
+# Create a document frequency matrix (dfm) and standard matrix
+
+train_tokens_dfm <- dfm(train_tokens, tolower = FALSE)
+train_tokens_matrix <- as.matrix(train_tokens_dfm)
+
+# Create a data frame with variable 'label' and clean variable names
+
+train_tokens_df <- convert(train_tokens_dfm, to = "data.frame") # Convert to data frame
+train_tokens_df <- cbind(Label = train$label, Document = train$patent_number, train_tokens_df[,-1]) # Add label and patent number; drop 'document' from tokens_df
+names(train_tokens_df) <- make.names(names(train_tokens_df)) # Clean up names
+#names(train_tokens_df)[1:2] <- c("Label","Document") # Capitalize to avoid confusion with same words in title text
+
+```
+
+The result of this pre-processing is a data frame with 3,500 rows (one for each observation, or patent) and 2,463 columns (one for each of the 2,461 unique word stems found in all the patent titles in the training set, plus the label indicator variable and a short document name). A portion of the output, below, shows how the two exemplary patents mentioned above appear in the prcoessed data.  Note for example that, for the first patent (US-8285621-B1, but now called 'text3'), the word 'and' has been removed, the word 'exchange' has been stemmed to 'exchang', and the numbers in each cell represent the number of times each word appears in that patent's title.  I have only displayed the first 21 columns as that is all that is needed to capture the data for these two patents.  All the remaining columns will contain zeros.  This reveals the inherent problem of sparsity, and the curse of dimensionality, the arise in text analytics.  Our training matrix is 99.7% sparse.
+
+```{r train_preout, echo = FALSE}
+train_tokens_df[3:4,1:21]
+```
+
+
+
+# Run TF-IDF on Training Data
+
+The last step before running the model on the training data set is to perform TF-IDF analysis.  Though there are packages that can do this, I wrote my own functions to implement the analysis so I know exactly what's happening to the data (though packaged versions might be more efficient with larger data sets).  
+```{r tfidf}
+          
+          ## Execute TF-IDF
+
+# TF-IDF functions
+term_freq <- function(row){row/sum(row)}
+inverse_doc_freq <- function(col){log10(length(col)/length(which(col > 0)))}
+tf_idf <- function(tf,idf){tf*idf}
+
+# Apply functions to training set
+train_df <- apply(train_tokens_matrix, 1, term_freq) 
+train_idf <- apply(train_tokens_matrix, 2, inverse_doc_freq)
+train_tfidf <- apply(train_df, 2, tf_idf, idf = train_idf)
+train_tfidf <- t(train_tfidf) # Take transpose to return to doc-term matrix
+```
+ 
+The first function, term_freq, effectively converts the term counts from above into term frequencies, based on the total number of words in each patent title.  Thus, the output for our two exemplary patents now looks like this, because each patent only had five meaningful word stems and each of those words only appeared in the title once:
+
+
+```{r train_tf, echo = FALSE}
+print(as.data.frame(t(train_df[1:21,3:4])))
+```
+ 
+The inverse document frequency is defined as the base 10 logarithm of the ratio of the number of documents and the number of documents in which a given word appears. Its purpose is to down-weight the term frequency scores for words that appear in many documents, like the frequently used patent terminology 'system' and 'method.'  The second function, inverse_doc_freq, calculates this quantity.  After applying this function to our training set, we obtain IDF scores for all 2,461 of our unique words, the first 21 of which are shown here:
+
+
+```{r train_idf, echo = FALSE}
+print(as.data.frame(t(train_idf[1:21])))
+```
+ 
+Next, I obtain a combined TF*IDF score, by applying the tf_idf function to the columns of the data set containing our term frequencies (train_df) using the stored IDF scores (train_idf).  As a result, the output for our two exemplary patents now looks like this:
+
+```{r train_tfidf, echo = FALSE}
+print(as.data.frame(train_tfidf[3:4,1:21]))
+```
+
+Note that the terms 'system' and 'method' have been significantly down weighted (from their original term frequency of 0.2 to 0.06), while the more substantive terms that appear less frequently across all patent titles have been up-weighted.
+
+The last step before running the model on the training data set is simply to replace any incomplete cases with zeros (there are none in this data set), add back our label indicator function, and clean up the variable names.
+ 
+```{r train_incomplete}
+# Replace incomplete cases with zeros
+incomplete_cases <- which(!complete.cases(train_tfidf))
+train_tfidf[incomplete_cases,] <- rep(0.0, ncol(train_tfidf))
+
+# Restore label and patent number (as a row name); make syntactically valid
+# variable names
+train_final <- cbind(Label = as.factor(train$label), data.frame(train_tfidf))
+row.names(train_final) = train$patent_number
+names(train_final) <- make.names(names(train_final))
+
+```
+
+
+# Run the Model on the Training Data
+
+After setting a random seed (so we can reproduce results), I implement 10-fold cross-validation on the training set.  The underlying model is a regression partition (or regression tree) in which our indicator variable, Label, is predicted based on our set of features (the TF-IDF score of unique word stems in patent titles).  I limit the model to 7 tuning parameters, meaning that of the 2,461 total features, it will discover the 7 parameters or word stems that are the most informative for classifying fintech patents.
+```{r run_model}
+
+          ## Run the model on the training set
+
+set.seed(02135)
+#start_time <- Sys.time()
+cv_folds <- createMultiFolds(train_final$Label, k = 10, times = 1)
+cv_cntrl <- trainControl(method = "cv", number = 10, index = cv_folds)
+rpart_cv1 <- train(Label ~ ., data = train_final, method = "rpart", 
+                    trControl = cv_cntrl, tuneLength = 7) # should be "repeatedcv" and repeats = 3 for repeated CV
+#total_time <- Sys.time() - start_time
+#total_time
+```
+
+# Visualize the Model
+
+The resulting model can be visualized as follows:
+
+```{r model_results}
+#print(rpart_cv1)
+#prp(rpart_cv1$finalModel, main="Fintech patent classification tree")
+rpart.plot(rpart_cv1$finalModel, main="Fintech patent classification tree")
+```
+
+The classification tree shows that the seven most informative word stems are "financi", "insur", "trade", "account", "credit", "auction", and "loan", in that order.  When those word stems have TF-IDF scores below certain thresholds (for example, when "financi" has a TF-IDF score less than 0.044), the patents are most likely not fintech patents (they should be classified as zeros instead of ones).
+
+# Pre-Process and Run TF-IDF on the Test Data
+
+With the model in hand, we now need to evaluate how well the model performs on the test data, which first must be pre-processed along the same lines as the training data.
+
+```{r }
+
+          ## Pre-process the test set
+
+test_tokens <- pre_process(test)
+
+# Create a document frequency matrix (dfm) and standard matrix; use dfm_select
+# to ensure that the test data has the same features as the training data
+# (discarding new word stems and adding zero counts for word stems in train but
+# not in test data)
+test_tokens_dfm <- dfm(test_tokens, tolower = FALSE)
+test_tokens_dfm <- dfm_select(test_tokens_dfm, pattern = train_tokens_dfm, selection = "keep")
+test_tokens_matrix <- as.matrix(test_tokens_dfm)
+
+# Create a data frame with variable 'label' and clean variable names
+test_tokens_df <- convert(test_tokens_dfm, to = "data.frame")
+test_tokens_df <- cbind(Label = test$label, Document = test$patent_number, test_tokens_df[,-1]) # Add label and patent number; drop 'document' from tokens_df
+names(test_tokens_df) <- make.names(names(test_tokens_df)) 
+
+# Project the term counts in the test data into the same TF-IDF vectore space as
+# the training data (note, this is why we cached train_idf).
+test_df <- apply(test_tokens_matrix, 1, term_freq)
+test_tfidf <- apply(test_df, 2, tf_idf, idf = train_idf)
+test_tfidf <- t(test_tfidf)
+
+# Replace incomplete cases with zeros
+incomplete_cases <- which(!complete.cases(test_tfidf))
+test_tfidf[incomplete_cases,] <- rep(0.0, ncol(test_tfidf))
+
+# Restore label and patent number (as a row name); make syntactically valid
+# variable names
+test_final <- cbind(Label = as.factor(test$label), data.frame(test_tfidf))
+row.names(test_final) = test$patent_number
+names(test_final) <- make.names(names(test_final))
+```
+
+# Use Model to Predict Outcomes in Test Data
+
+After pre-processing the test data, I test how well the model performs in predicting whether or not a patent is a fintech patent or not in the test data.  
+
+```{r}
+predictions <- predict(rpart_cv1, test_final)
+confusionMatrix(predictions, reference = test_final$Label)
+```
+As the output shows, at the moment, our model has tremendous sensitivity but very poor specificity.  In other words, the model does very well in predicting what is not a fintech patent (we have only 21 mis-classified non-fintech patetns out of 1,227) but does not perform well in predicting what is a fintech patent (we have 195 mis-classified fintech patents out of only 273).  This could be a function of the very small sample size we took from the outset to make the model run on a personal computer.  It could also mean that we need richer text (abstracts instead of titles) or richer feature sets (bi-grams instead of single words).  
+
+Overall, we have a false negative rate of about 13.9 percent (195 false negatives out of 1401 predicted negatives), and a false positive rate of about 21.2 percent (21 false positives out of 99 predicted positives).
+
+
+
+
+
+
+
+
+
+
+
+
